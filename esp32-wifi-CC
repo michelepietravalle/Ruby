@@ -1,0 +1,239 @@
+#include <WiFi.h>
+#include <WiFiUdp.h>     // Importante: includere prima di AppleMIDI per Type=WiFiUDP
+#include <AppleMIDI.h>
+#include <math.h>
+
+// WiFi credentials
+const char* SSID     = "TeslaLab";
+const char* PASSWORD = "altatensione";
+
+// Static IP config (adatta gateway/subnet/DNS se necessario)
+IPAddress ip(10, 42, 42, 31);
+IPAddress gw(10, 42, 42, 1);
+IPAddress subnet(255, 255, 255, 0);
+IPAddress dns(1, 1, 1, 1);
+
+// AppleMIDI 3.3.0: macro con 4 argomenti (Type, Name, SessionName, Port)
+// Crea l'istanza AppleMIDI su WiFiUDP, sessione "ESP32-RTPMIDI", porta base 5004
+APPLEMIDI_CREATE_INSTANCE(WiFiUDP, AppleMIDI, "ESP32-RTPMIDI", 5004);
+
+// Sintesi
+#define NUM_VOICES        4
+#define AUDIO_SAMPLE_RATE 22050
+#define TABLE_SIZE        256
+
+struct Voice {
+  bool  active;
+  bool  keyOn;         // true se il tasto è premuto (NoteOn senza NoteOff corrispondente)
+  bool  heldByPedal;   // true se trattenuto dal sustain (CC64 >= 64)
+  byte  note;
+  float freq;
+  float phase;         // 0..TABLE_SIZE
+  float phaseInc;      // increment per sample
+  uint32_t tOn;
+  float env;           // 0..1
+  float envStep;       // >0 attack, <0 release, =0 hold
+};
+
+Voice voices[NUM_VOICES];
+uint8_t sineTable[TABLE_SIZE];
+
+// Global CC parameters
+float masterGain     = 1.0f;  // mappato da CC7 (0..1)
+bool  sustainOn      = false; // CC64
+float vibratoDepth   = 0.0f;  // frazione di detune (0..~0.02), da CC1
+float vibratoRateHz  = 5.0f;  // fisso (puoi mappare su altro CC se vuoi)
+float vibratoPhase   = 0.0f;
+float vibratoInc     = 2.0f * 3.1415926f * 5.0f / AUDIO_SAMPLE_RATE; // aggiornato in setup
+float harm3Amount    = 0.0f;  // quantità 3ª armonica (0..0.3) da CC74
+
+static inline float midi2freq(byte n) {
+  return 440.0f * powf(2.0f, (n - 69) / 12.0f);
+}
+
+void onNoteOn(byte channel, byte note, byte velocity) {
+  int freeVoice = -1;
+  uint32_t oldest = millis();
+  for (int i = 0; i < NUM_VOICES; i++) {
+    if (!voices[i].active) { freeVoice = i; break; }
+    if (voices[i].tOn < oldest) { oldest = voices[i].tOn; freeVoice = i; }
+  }
+  if (freeVoice < 0) freeVoice = 0;
+
+  voices[freeVoice].active   = true;
+  voices[freeVoice].keyOn    = true;
+  voices[freeVoice].heldByPedal = false;
+  voices[freeVoice].note     = note;
+  voices[freeVoice].freq     = midi2freq(note);
+  voices[freeVoice].phase    = 0.0f;
+  voices[freeVoice].phaseInc = voices[freeVoice].freq * TABLE_SIZE / AUDIO_SAMPLE_RATE;
+  voices[freeVoice].tOn      = millis();
+  voices[freeVoice].env      = 0.0f;
+  voices[freeVoice].envStep  = 0.01f + 0.02f * (velocity / 127.0f); // attack
+}
+
+void onNoteOff(byte channel, byte note, byte velocity) {
+  for (int i = 0; i < NUM_VOICES; i++) {
+    if (voices[i].active && voices[i].note == note) {
+      voices[i].keyOn = false;
+      if (sustainOn) {
+        voices[i].heldByPedal = true;
+        voices[i].envStep = 0.0f; // hold finché il pedale non viene rilasciato
+      } else {
+        voices[i].envStep = -0.003f; // release
+      }
+    }
+  }
+}
+
+void onControlChange(byte channel, byte number, byte value) {
+  switch (number) {
+    case 7: { // Volume (0..127) -> masterGain (0..1)
+      masterGain = value / 127.0f;
+      break;
+    }
+    case 1: { // Modulation (vibrato depth)
+      // mappa 0..127 a ±2% circa di detune (puoi aumentare)
+      vibratoDepth = (value / 127.0f) * 0.02f; // 0..0.02
+      break;
+    }
+    case 64: { // Sustain pedal
+      bool newSustain = (value >= 64);
+      if (sustainOn && !newSustain) {
+        // Pedale rilasciato: rilascia le voci che erano tenute dal pedale e non hanno keyOn
+        for (int i = 0; i < NUM_VOICES; i++) {
+          if (voices[i].active && voices[i].heldByPedal && !voices[i].keyOn) {
+            voices[i].heldByPedal = false;
+            voices[i].envStep = -0.003f;
+          }
+        }
+      }
+      sustainOn = newSustain;
+      break;
+    }
+    case 74: { // Brightness -> aggiunge 3a armonica
+      harm3Amount = (value / 127.0f) * 0.30f; // fino a 30% della fondamentale
+      break;
+    }
+    default:
+      // altri CC ignorati (aggiungi mapping se ti serve)
+      break;
+  }
+}
+
+bool connectWiFiStaticIP() {
+  WiFi.mode(WIFI_STA);
+  if (!WiFi.config(ip, gw, subnet, dns)) {
+    Serial.println("WiFi.config failed (static IP).");
+    return false;
+  }
+  WiFi.begin(SSID, PASSWORD);
+
+  Serial.print("Connecting to WiFi");
+  const uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+    if (millis() - t0 > 15000) {
+      Serial.println("\nWiFi connect timeout.");
+      return false;
+    }
+  }
+  Serial.print("\nWiFi connected. IP: ");
+  Serial.println(WiFi.localIP());
+  return true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("ESP32 WiFi RTP-MIDI (AppleMIDI 3.3.0) - Polyphonic DAC Synth + CC");
+
+  // Tabella sinusoide
+  for (int i = 0; i < TABLE_SIZE; ++i) {
+    sineTable[i] = (uint8_t)(127.5f * (1.0f + sinf(2.0f * 3.1415926f * i / TABLE_SIZE)));
+  }
+
+  // WiFi con IP statico
+  if (!connectWiFiStaticIP()) {
+    Serial.println("Retrying WiFi with static IP...");
+    delay(2000);
+    connectWiFiStaticIP();
+  }
+
+  // AppleMIDI 3.3.0: avvio e handler
+  AppleMIDI.begin(); // in 3.3.0 si usa begin() senza argomenti
+  AppleMIDI.setHandleNoteOn(onNoteOn);
+  AppleMIDI.setHandleNoteOff(onNoteOff);
+  AppleMIDI.setHandleControlChange(onControlChange);
+
+  // Inizializza voci
+  for (int i = 0; i < NUM_VOICES; i++) {
+    voices[i] = {false, false, false, 0, 0, 0, 0, 0, 0, 0};
+  }
+
+  // LFO vibrato
+  vibratoInc = 2.0f * 3.1415926f * vibratoRateHz / AUDIO_SAMPLE_RATE;
+
+  // DAC center (GPIO25). Cambia a 26 se preferisci DAC2.
+  dacWrite(25, 128);
+}
+
+unsigned long lastSampleMicros = 0;
+
+void loop() {
+  // AppleMIDI 3.3.0: processa pacchetti RTP-MIDI
+  AppleMIDI.read();
+
+  // Generazione audio a frequenza fissa
+  const unsigned long Ts = 1000000UL / AUDIO_SAMPLE_RATE;
+  unsigned long now = micros();
+  if ((now - lastSampleMicros) < Ts) return;
+  lastSampleMicros += Ts;  // riduce jitter cumulativo
+
+  // Aggiorna LFO vibrato
+  vibratoPhase += vibratoInc;
+  if (vibratoPhase > 2.0f * 3.1415926f) vibratoPhase -= 2.0f * 3.1415926f;
+  float vib = sinf(vibratoPhase); // -1..+1
+
+  float mix = 0.0f;
+
+  for (int v = 0; v < NUM_VOICES; v++) {
+    if (!voices[v].active && voices[v].env <= 0.0f) continue;
+
+    // Envelope
+    voices[v].env += voices[v].envStep;
+    if (voices[v].envStep > 0 && voices[v].env > 1.0f) voices[v].env = 1.0f;
+    if (voices[v].envStep < 0 && voices[v].env <= 0.0f) {
+      voices[v].env = 0.0f;
+      voices[v].active = false;
+      voices[v].heldByPedal = false;
+      continue;
+    }
+
+    // Oscillatore: fase con vibrato (modulazione in frequenza)
+    float modFactor = 1.0f + vibratoDepth * vib; // ~0.98..1.02
+    voices[v].phase += voices[v].phaseInc * modFactor;
+    if (voices[v].phase >= TABLE_SIZE) voices[v].phase -= TABLE_SIZE;
+
+    uint8_t idx1 = (uint8_t)voices[v].phase;
+    float s1 = (sineTable[idx1] - 128) / 128.0f;
+
+    // 3a armonica (opzionale via CC74)
+    float s = s1;
+    if (harm3Amount > 0.0001f) {
+      float ph3 = voices[v].phase * 3.0f;
+      while (ph3 >= TABLE_SIZE) ph3 -= TABLE_SIZE;
+      uint8_t idx3 = (uint8_t)ph3;
+      float s3 = (sineTable[idx3] - 128) / 128.0f;
+      s = (1.0f - harm3Amount) * s1 + harm3Amount * s3;
+    }
+
+    mix += s * voices[v].env;
+  }
+
+  // Limita e scala (headroom 0.6) con masterGain (CC7)
+  mix = fmaxf(-1.0f, fminf(1.0f, mix * (0.6f * masterGain)));
+  uint8_t out = (uint8_t)(128 + mix * 96);
+  dacWrite(25, out);
+}
