@@ -1,0 +1,28 @@
+{
+  "name": "Ruby ESP32 RTP-MIDI Polyphonic Audio",
+  "version": "1.0.0",
+  "description": "ESP32 RTP-MIDI polyphonic audio system for Rubens tube",
+  "keywords": [
+    "esp32",
+    "midi",
+    "rtp-midi",
+    "audio",
+    "polyphonic",
+    "rubens-tube"
+  ],
+  "authors": [
+    {
+      "name": "Michele Pietravalle"
+    }
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/michelepietravalle/Ruby"
+  },
+  "frameworks": "arduino",
+  "platforms": "espressif32",
+  "dependencies": {
+    "AppleMIDI": "^3.2.0",
+    "ESP32-audioI2S": "^2.0.0"
+  }
+}
