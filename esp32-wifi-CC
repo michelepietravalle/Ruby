@@ -5,7 +5,7 @@
 
 // WiFi credentials
 const char* SSID     = "TeslaLab";
-const char* PASSWORD = "altatensione";
+const char* PASSWORD = "xxxxxxxx";
 
 // Static IP config (adatta gateway/subnet/DNS se necessario)
 IPAddress ip(10, 42, 42, 31);
