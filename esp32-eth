@@ -1,0 +1,134 @@
+#include <SPI.h>
+#include <Ethernet.h>
+#include <EthernetUdp.h>   // Importante: prima di AppleMIDI con Type=EthernetUDP
+#include <AppleMIDI.h>
+
+// Ethernet (W5500) static IP
+byte mac[] = { 0xDE, 0xAD, 0x42, 0x42, 0x42, 0x31 };
+IPAddress ip(10, 42, 42, 31);
+
+// AppleMIDI 3.3.0: macro con 4 argomenti (Type, Name, SessionName, Port)
+// Crea l'istanza AppleMIDI (Nome) su EthernetUDP, sessione "ESP32-RTPMIDI", porta base 5004
+APPLEMIDI_CREATE_INSTANCE(EthernetUDP, AppleMIDI, "ESP32-RTPMIDI", 5004);
+
+// Sintesi
+#define NUM_VOICES        4
+#define AUDIO_SAMPLE_RATE 22050
+#define TABLE_SIZE        256
+
+struct Voice {
+  bool active;
+  byte note;
+  float freq;
+  float phase;
+  float phaseInc;
+  uint32_t tOn;
+  float env;
+  float envStep;
+};
+
+Voice voices[NUM_VOICES];
+uint8_t sineTable[TABLE_SIZE];
+
+static inline float midi2freq(byte n) {
+  return 440.0f * powf(2.0f, (n - 69) / 12.0f);
+}
+
+// Callback MIDI (stile FortySevenEffects)
+void onNoteOn(byte channel, byte note, byte velocity) {
+  int freeVoice = -1;
+  uint32_t oldest = millis();
+  for (int i = 0; i < NUM_VOICES; i++) {
+    if (!voices[i].active) { freeVoice = i; break; }
+    if (voices[i].tOn < oldest) { oldest = voices[i].tOn; freeVoice = i; }
+  }
+  if (freeVoice < 0) freeVoice = 0;
+
+  voices[freeVoice].active   = true;
+  voices[freeVoice].note     = note;
+  voices[freeVoice].freq     = midi2freq(note);
+  voices[freeVoice].phase    = 0.0f;
+  voices[freeVoice].phaseInc = voices[freeVoice].freq * TABLE_SIZE / AUDIO_SAMPLE_RATE;
+  voices[freeVoice].tOn      = millis();
+  voices[freeVoice].env      = 0.0f;
+  voices[freeVoice].envStep  = 0.01f + 0.02f * (velocity / 127.0f); // attack
+}
+
+void onNoteOff(byte channel, byte note, byte velocity) {
+  for (int i = 0; i < NUM_VOICES; i++) {
+    if (voices[i].active && voices[i].note == note) {
+      voices[i].envStep = -0.003f; // release
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(200);
+  Serial.println("ESP32 W5500 RTP-MIDI (AppleMIDI 3.3.0) - Polyphonic DAC Synth");
+
+  // Sine table
+  for (int i = 0; i < TABLE_SIZE; ++i) {
+    sineTable[i] = (uint8_t)(127.5f * (1.0f + sinf(2.0f * 3.1415926f * i / TABLE_SIZE)));
+  }
+
+  // Ethernet W5500
+  Ethernet.init(5);                // CS su GPIO5 (adatta al tuo shield)
+  Ethernet.begin(mac, ip);
+  delay(250);
+  Serial.print("IP: "); Serial.println(Ethernet.localIP());
+
+  // AppleMIDI 3.3.0
+  AppleMIDI.begin();               // con 3.3.0 si chiama begin() senza argomenti
+  AppleMIDI.setHandleNoteOn(onNoteOn);
+  AppleMIDI.setHandleNoteOff(onNoteOff);
+
+  // Voci
+  for (int i = 0; i < NUM_VOICES; i++) {
+    voices[i] = {false, 0, 0, 0, 0, 0, 0, 0};
+  }
+
+  // DAC center
+  dacWrite(25, 128);
+}
+
+unsigned long lastSampleMicros = 0;
+
+void loop() {
+  // AppleMIDI 3.3.0: processa pacchetti
+  AppleMIDI.read();
+
+  // Generazione audio a frequenza fissa
+  const unsigned long Ts = 1000000UL / AUDIO_SAMPLE_RATE;
+  unsigned long now = micros();
+  if ((now - lastSampleMicros) < Ts) return;
+  lastSampleMicros += Ts;  // riduce jitter cumulativo
+
+  float mix = 0.0f;
+
+  for (int v = 0; v < NUM_VOICES; v++) {
+    if (!voices[v].active && voices[v].env <= 0.0f) continue;
+
+    // Envelope
+    voices[v].env += voices[v].envStep;
+    if (voices[v].envStep > 0 && voices[v].env > 1.0f) voices[v].env = 1.0f;
+    if (voices[v].envStep < 0 && voices[v].env <= 0.0f) {
+      voices[v].env = 0.0f;
+      voices[v].active = false;
+      continue;
+    }
+
+    // Oscillatore sinusoide
+    uint8_t idx = (uint8_t)voices[v].phase;
+    float vs = (sineTable[idx] - 128) / 128.0f;
+    mix += vs * voices[v].env;
+
+    voices[v].phase += voices[v].phaseInc;
+    if (voices[v].phase >= TABLE_SIZE) voices[v].phase -= TABLE_SIZE;
+  }
+
+  // Limita e scala
+  mix = fmaxf(-1.0f, fminf(1.0f, mix * 0.6f));
+  uint8_t out = (uint8_t)(128 + mix * 96);
+  dacWrite(25, out);
+}
